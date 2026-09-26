@@ -207,9 +207,10 @@ function canManage(actor, target) {
   return false
 }
 
-// ===== 细粒度操作范围校验（设备控制 / 场景执行 / 定额 / 工单统一入口）=====
+// ===== 细粒度操作范围校验（设备控制 / 场景 / 定额 / 工单全部链路的统一入口）=====
 // 全屋（户主或未设范围）放行；限定范围取「授权房间（按设备当前房间）∪ 显式授权设备」并集。
 // deviceRow 需含 id 与 room_id；roomId 为房间维度授权（如新建设备落到某房间）。
+// 所有判定统一前置「在组成员」（status=active），撤销身份在任何链路都不再命中授权。
 export function canAccessDevice(who, deviceRow) {
   if (!who || who.status !== 'active' || !deviceRow) return false
   if (who.role === 'owner') return true
@@ -223,6 +224,71 @@ export function canAccessRoom(who, roomId) {
   const sc = memberScope(who)
   if (sc.rooms.length === 0 && sc.devices.length === 0) return true
   return sc.rooms.includes(Number(roomId))
+}
+
+// 跨表范围判定用的懒准备语句：quota_alerts 等表由后续模块建表（initFamily 先于 initQuota），
+// 首次使用时再 prepare，避免模块初始化顺序耦合
+const lazyStmts = {}
+function lazy(key, sql) {
+  if (!lazyStmts[key]) lazyStmts[key] = db.prepare(sql)
+  return lazyStmts[key]
+}
+
+// 定额对象（energy_quotas 行，或批量新建时的 {scope,room_id,device_id} 描述）是否在范围内：
+// 房间定额按房间授权判定；设备定额按「设备当前房间 ∪ 显式设备授权」判定；
+// 设备已删除时仅剩显式设备授权可命中（其余成员的该设备定额操作收敛为全屋身份可办）。
+export function canAccessQuota(who, quotaRow) {
+  if (!who || who.status !== 'active' || !quotaRow) return false
+  if (isUnscoped(who)) return true
+  if (quotaRow.scope === 'room') return canAccessRoom(who, quotaRow.room_id)
+  const d = lazy('devRoom', 'SELECT id,room_id FROM devices WHERE id=?').get(quotaRow.device_id)
+  return d ? canAccessDevice(who, d) : memberScope(who).devices.includes(Number(quotaRow.device_id))
+}
+
+// 工单对象（work_orders 行）是否在范围内：设备工单按设备判定；
+// 定额超标工单按其告警归属的定额对象判定（与 canAccessQuota 同一口径）
+export function canAccessWorkOrder(who, wo) {
+  if (!who || who.status !== 'active' || !wo) return false
+  if (isUnscoped(who)) return true
+  if (wo.device_id != null) {
+    const d = lazy('devRoom', 'SELECT id,room_id FROM devices WHERE id=?').get(wo.device_id)
+    return d ? canAccessDevice(who, d) : memberScope(who).devices.includes(Number(wo.device_id))
+  }
+  if (wo.quota_alert_id != null) {
+    const a = lazy('alertScope', `SELECT q.scope q_scope, q.room_id, q.device_id
+                                  FROM quota_alerts qa JOIN energy_quotas q ON q.id=qa.quota_id
+                                  WHERE qa.id=?`).get(wo.quota_alert_id)
+    if (!a) return false
+    return canAccessQuota(who, { scope: a.q_scope, room_id: a.room_id, device_id: a.device_id })
+  }
+  return false
+}
+
+// 场景链路统一范围判定（新建 / 启停 / 删除 / 触发同一口径）：场景内「可解析的绑定设备」
+// 必须全部在操作范围内，否则整体拒绝（原子判定，绝不执行一半）；
+// 已删除/重名待绑定的失效动作不算越界（触发时按既有逻辑逐项跳过）。
+// 返回越界设备名列表，空数组 = 不越界；无身份时按全部越界处理（安全兜底，路由已有 401 拦截）。
+export function sceneOutOfScopeDevices(who, sceneId) {
+  if (isUnscoped(who)) return []
+  const rows = lazy('sceneDevs', `SELECT d.id did, d.name dname, d.room_id droom
+                                  FROM scene_actions sa JOIN devices d ON d.id=sa.device_id
+                                  WHERE sa.scene_id=?`).all(sceneId)
+  return rows.filter((r) => !canAccessDevice(who, { id: r.did, room_id: r.droom })).map((r) => r.dname)
+}
+
+// 设备换房的范围迁移审计：房间授权按设备当前房间动态判定（换房当场进出），
+// 显式设备授权绑定 device_id 自动跟随（范围不变，无需审计）。
+// 返回因换房而新覆盖/被移出的在组成员名单，供设备更新日志留痕。
+export function roomMoveScopeAudit(deviceId, oldRoomId, newRoomId) {
+  const gained = [], lost = []
+  for (const m of db.prepare("SELECT * FROM household_members WHERE status='active' AND role<>'owner'").all()) {
+    const sc = memberScope(m)
+    if (!sc.rooms.length && !sc.devices.length) continue          // 全屋成员不受影响
+    if (sc.devices.includes(Number(deviceId))) continue            // 显式设备授权随设备迁移，范围不变
+    if (sc.rooms.includes(Number(newRoomId)) && !sc.rooms.includes(Number(oldRoomId))) gained.push(m.name)
+    if (sc.rooms.includes(Number(oldRoomId)) && !sc.rooms.includes(Number(newRoomId))) lost.push(m.name)
+  }
+  return { gained, lost }
 }
 
 // 范围中文摘要（家庭日志/前端展示共用）：优先用传入的房间、设备列表解析名字，
@@ -379,7 +445,10 @@ export function updateMember(actor, id, { name, relation, role, perms, scope_roo
   if (!canManage(actor, { role: nextRole })) throw new Error(`无权设置「${ROLE_LABEL[nextRole]}」角色`)
   const dup = db.prepare('SELECT id FROM household_members WHERE name=? AND id<>?').get(nextName, m.id)
   if (dup) throw new Error('该名称已被其他成员使用')
-  const nextPerms = JSON.stringify(validPerms(perms))
+  // 自定义权限缺省（未传字段）时保持原值；显式传入才覆盖——与范围字段同一口径，
+  // 避免只调整范围的调用方把既有授权静默清空（授权变更必须显式、可审计）
+  const nextPermList = perms === undefined ? parsePerms(m.perms) : validPerms(perms)
+  const nextPerms = JSON.stringify(nextPermList)
   // 范围缺省（未传字段）时保持原值；显式传入才覆盖，避免旧调用方误清空
   const nextScopeRooms = scope_rooms === undefined ? parseIdList(m.scope_rooms) : validIdList(scope_rooms)
   const nextScopeDevices = scope_devices === undefined ? parseIdList(m.scope_devices) : validIdList(scope_devices)
@@ -389,7 +458,7 @@ export function updateMember(actor, id, { name, relation, role, perms, scope_roo
   if (relation !== undefined && relation !== m.relation) changes.push(`称呼「${m.relation || '—'}」→「${relation || '—'}」`)
   if (nextRole !== m.role) changes.push(`角色 ${ROLE_LABEL[m.role]}→${ROLE_LABEL[nextRole]}`)
   const oldSet = new Set(effectivePerms(m))
-  const nextSet = new Set([...(ROLE_PERMS[nextRole] || []), ...validPerms(perms)])
+  const nextSet = new Set([...(ROLE_PERMS[nextRole] || []), ...nextPermList])
   const granted = [...nextSet].filter((p) => !oldSet.has(p))
   const revoked = [...oldSet].filter((p) => !nextSet.has(p))
   if (granted.length) changes.push(`授予：${granted.map((p) => PERMISSIONS[p].split('（')[0]).join('、')}`)
@@ -499,6 +568,9 @@ function memberView(m) {
     id: m.id, name: m.name, relation: m.relation, role: m.role,
     role_label: ROLE_LABEL[m.role],
     status: m.status, status_label: STATUS_LABEL[m.status],
+    // 演示环境无登录体系：名册即登录入口，令牌随名册下发供前端切换身份；
+    // 撤销后令牌已置空（不下发有效令牌），恢复/重新接受时换新令牌
+    token: m.status === 'active' ? m.token : null,
     perms: parsePerms(m.perms),
     effective_perms: effectivePerms(m),
     scope_rooms: sc.rooms,

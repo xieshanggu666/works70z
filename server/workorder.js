@@ -14,6 +14,8 @@
 //   源告警恢复时未完成工单自动重新挂上源；已完成工单必须经历「告警消失→再次出现」
 //   才会另开新单（同一问题持续未消除不重复建工单）。
 
+import { can } from './family.js'
+
 const TICK_MS = 30_000
 
 // 源告警类型：离线 / 低电量 / 信号弱 / 能耗超标（仅 error 级超标，80% 预警不开单）
@@ -347,6 +349,10 @@ function operateWorkOrderRaw(wo, action, actor, { assignee_id, note } = {}, at =
     const targetId = Number(assignee_id)
     const target = stmts.memberById.get(targetId)
     if (!target) throw new Error('请选择有效的在组成员作为处理人')
+    // 与前端候选过滤同一口径：处理人必须持有工单处理权限，
+    // 否则工单将分派给永远无人可执行的成员（前后端统一判定，服务端最终裁决）
+    if (!can(target, 'workorder_handle'))
+      throw new Error(`「${target.name}」没有工单处理权限，无法作为处理人`)
     nextAssigneeId = target.id
     nextAssigneeName = target.name
     const isReassign = wo.status === 'dispatched' || wo.status === 'accepted'
@@ -427,9 +433,13 @@ export function batchOperateWorkOrders({ ids, action, assignee_id, note } = {}, 
   if (!Array.isArray(ids) || !ids.length) throw new Error('请选择至少一张工单')
   if (ids.length > BATCH_LIMIT) throw new Error(`单次批量最多 ${BATCH_LIMIT} 张工单`)
   if (!actor || actor.status !== 'active') throw new Error('身份无效，无法操作工单')
-  // 共享参数整批校验：分派处理人必须是在组成员；挂起/完成/复开备注必填（与单条口径一致）
-  if (action === 'dispatch' && !stmts.memberById.get(Number(assignee_id)))
-    throw new Error('请选择有效的在组成员作为处理人')
+  // 共享参数整批校验：分派处理人必须是在组成员且持有工单处理权限（与单条同一口径）；
+  // 挂起/完成/复开备注必填
+  if (action === 'dispatch') {
+    const t = stmts.memberById.get(Number(assignee_id))
+    if (!t) throw new Error('请选择有效的在组成员作为处理人')
+    if (!can(t, 'workorder_handle')) throw new Error(`「${t.name}」没有工单处理权限，无法作为处理人`)
+  }
   const noteText = String(note || '').trim()
   if (action === 'suspend' && !noteText) throw new Error('批量挂起必须填写挂起原因')
   if (action === 'complete' && !noteText) throw new Error('批量完成必须填写处理结果说明')

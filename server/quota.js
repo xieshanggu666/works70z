@@ -643,10 +643,11 @@ export function handleAlert(id, { status, note }) {
 }
 
 // ===== 告警批量处理：同一状态流转 + 同一备注应用到多条告警 =====
-// 逐条复用 handleAlert 的完整状态机校验（含重新打开前的周期/越线复核），
+// 逐条复用 handleAlert 的完整状态机校验（含重新打开前的周期/越线复核）；
+// authorize 回调做逐项范围授权（与批量定额配置、批量工单同一口径）：越权项标记 no_scope，
 // 单条不合法（如已闭环告警不能「开始处理」）只标记该条，不拖垮整批；
 // 每条成功项由调用方写入家庭日志时间线，形成逐项审计。
-export function batchHandleAlerts(ids, { status, note }) {
+export function batchHandleAlerts(ids, { status, note }, authorize = null) {
   if (!Array.isArray(ids) || !ids.length) throw new Error('请选择至少一条告警')
   if (ids.length > BATCH_LIMIT) throw new Error(`单次批量最多 ${BATCH_LIMIT} 条告警`)
   if (!['open', 'handling', 'resolved', 'ignored'].includes(status)) throw new Error('处理状态无效')
@@ -662,10 +663,13 @@ export function batchHandleAlerts(ids, { status, note }) {
       continue
     }
     try {
+      // 逐项范围授权：越权项标记 no_scope，与状态机冲突同一出口、不拖垮整批
+      if (authorize && !authorize(before))
+        throw Object.assign(new Error('超出操作范围（房间/设备未授权）'), { noScope: true })
       const after = handleAlert(id, { status, note })
       results.push({ ok: true, id, label, message: `已流转为「${STATUS_LABEL[after.status]}」`, alert: after })
     } catch (e) {
-      results.push({ ok: false, id, label, message: e.message })
+      results.push({ ok: false, id, label, message: e.message, no_scope: !!e.noScope })
     }
   }
   return { results, applied: results.filter((r) => r.ok).length, failed: results.filter((r) => !r.ok).length }

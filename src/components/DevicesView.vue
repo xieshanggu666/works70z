@@ -40,7 +40,8 @@
           <span>📶{{ d.signal }}</span>
           <span>⚡{{ d.watts }}W</span>
           <input v-if="canControl && canOp(d)" class="inline-edit" :value="d.watts" type="number" @change="store.updateDevice(d.id,{watts:+$event.target.value})" title="编辑功率(W)"/>
-          <select v-if="canControl && canOp(d)" class="inline-room" :value="d.room_id" @change="moveRoom(d, +$event.target.value)" title="换房（设备授权自动跟随，房间授权同步迁移并审计）">
+          <select v-if="canControl && canOp(d) && addableRooms.length" class="inline-room" :value="d.room_id" @change="moveRoom(d, +$event.target.value)" title="换房（设备授权自动跟随，房间授权同步迁移并审计；目标房间与后端校验同口径，仅可迁入授权房间）">
+            <option v-if="!addableRooms.some((r) => r.id === d.room_id)" :value="d.room_id" disabled>{{ d.room }}（当前·非授权房间）</option>
             <option v-for="r in addableRooms" :key="r.id" :value="r.id">→ {{ r.name }}</option>
           </select>
         </div>

@@ -10,8 +10,9 @@ import {
   initFamily, getMemberByToken, listFamily, can,
   createInvite, acceptInvite, previewInvite, cancelInvite, resendInvite,
   updateMember, revokeMember, restoreMember, reinviteMember,
-  canAccessDevice, canAccessRoom, isUnscoped, memberScope, scopeSummary,
-  ROLE_LABEL, PERMISSIONS
+  canAccessDevice, canAccessRoom, canAccessQuota, canAccessWorkOrder,
+  sceneOutOfScopeDevices, roomMoveScopeAudit,
+  isUnscoped, ROLE_LABEL, PERMISSIONS
 } from './family.js'
 import {
   initWorkOrders, syncWorkOrders, operateWorkOrder, batchOperateWorkOrders,
@@ -85,46 +86,11 @@ function requirePerm(perm) {
 }
 
 // ===== 按房间/设备的细粒度操作范围（设备控制 / 场景 / 定额 / 工单统一校验）=====
+// 守卫实现单源化在 family.js：canAccessDevice / canAccessRoom / canAccessQuota /
+// canAccessWorkOrder / sceneOutOfScopeDevices / roomMoveScopeAudit，
+// 各业务链路（含批量接口的逐项授权回调）全部复用同一套判定，避免口径漂移。
 function scopeDenied(res, text) {
   return res.status(403).json({ error: `超出当前操作范围：${text}（可在「家庭共享」中由管理员调整授权房间/设备）`, no_perm: true, out_of_scope: true })
-}
-// 定额对象（room/device 行，需含 scope/room_id/device_id）是否在成员范围内
-function canAccessQuota(member, quotaRow) {
-  if (!quotaRow || !member) return false
-  if (isUnscoped(member)) return true
-  if (quotaRow.scope === 'room') return canAccessRoom(member, quotaRow.room_id)
-  const d = q1('SELECT id,room_id FROM devices WHERE id=?', quotaRow.device_id)
-  // 设备已删除且成员无显式设备授权：限定范围成员无法再操作该设备定额（审计/告警处理仅全屋管理员可办）
-  return d ? canAccessDevice(member, d) : memberScope(member).devices.includes(Number(quotaRow.device_id))
-}
-// 工单对象（work_orders 行）是否在成员范围内
-function canAccessWorkOrder(member, wo) {
-  if (!wo || !member) return false
-  if (isUnscoped(member)) return true
-  if (wo.device_id != null) {
-    const d = q1('SELECT id,room_id FROM devices WHERE id=?', wo.device_id)
-    if (d) return canAccessDevice(member, d)
-    return memberScope(member).devices.includes(Number(wo.device_id))
-  }
-  if (wo.quota_alert_id != null) {
-    const a = q1('SELECT qa.*, q.scope q_scope, q.room_id, q.device_id FROM quota_alerts qa JOIN energy_quotas q ON q.id=qa.quota_id WHERE qa.id=?', wo.quota_alert_id)
-    if (!a) return false
-    return canAccessQuota(member, { scope: a.q_scope, room_id: a.room_id, device_id: a.device_id })
-  }
-  return false
-}
-// 换房时计算受操作范围影响的在组成员，供设备更新审计（房间授权按当前房间动态判定，
-// 设备授权绑定 device_id 自动跟随——这里只需审计「房间授权随换房而进出」的成员）
-function roomMoveScopeAudit(deviceId, oldRoomId, newRoomId) {
-  const gained = [], lost = []
-  for (const m of q("SELECT * FROM household_members WHERE status='active' AND role<>'owner'")) {
-    const sc = memberScope(m)
-    if (!sc.rooms.length && !sc.devices.length) continue          // 全屋成员不受影响
-    if (sc.devices.includes(Number(deviceId))) continue            // 显式设备授权随设备迁移，范围不变
-    if (sc.rooms.includes(Number(newRoomId)) && !sc.rooms.includes(Number(oldRoomId))) gained.push(m.name)
-    if (sc.rooms.includes(Number(oldRoomId)) && !sc.rooms.includes(Number(newRoomId))) lost.push(m.name)
-  }
-  return { gained, lost }
 }
 
 // ===== 状态聚合 =====
@@ -314,16 +280,22 @@ app.post('/api/scene', requirePerm('scene_manage'), (req, res) => {
 })
 app.delete('/api/scene/:id', requirePerm('scene_manage'), (req, res) => {
   const s = q1('SELECT * FROM scenes WHERE id=?', req.params.id)
-  if (s) {
-    run('DELETE FROM scenes WHERE id=?', s.id)
-    run('DELETE FROM scene_actions WHERE scene_id=?', s.id)
-    log(s.name, '删除场景', '', { category: 'scene' })
-  }
+  if (!s) return res.status(404).json({ error: 'not found' })
+  // 与触发/启停同一套范围守卫：含范围外设备的场景不可删除（原子判定，失效引用不算越界）
+  const out = sceneOutOfScopeDevices(req.member, s.id)
+  if (out.length) return scopeDenied(res, `不能删除含范围外设备的场景：${out.join('、')}`)
+  run('DELETE FROM scenes WHERE id=?', s.id)
+  run('DELETE FROM scene_actions WHERE scene_id=?', s.id)
+  log(s.name, '删除场景', '', { category: 'scene' })
   res.json({ ok: true })
 })
 app.post('/api/scene/:id/toggle', requirePerm('scene_manage'), (req, res) => {
   const s = q1('SELECT * FROM scenes WHERE id=?', req.params.id)
   if (!s) return res.status(404).json({ error: 'not found' })
+  // 场景启停与触发同一套范围守卫：可解析的绑定设备全部在范围内才允许启停，
+  // 避免限定范围成员借启停操控全屋场景（与新建编排、触发执行同一判定函数）
+  const out = sceneOutOfScopeDevices(req.member, s.id)
+  if (out.length) return scopeDenied(res, `不能启停含范围外设备的场景：${out.join('、')}`)
   run('UPDATE scenes SET enabled=? WHERE id=?', s.enabled ? 0 : 1, s.id)
   log(s.name, s.enabled ? '停用场景' : '启用场景', '', { category: 'scene' })
   res.json({ ok: true, enabled: s.enabled ? 0 : 1 })
@@ -338,12 +310,11 @@ app.post('/api/scene/:id/run', requirePerm('scene_execute'), (req, res) => {
                      FROM scene_actions sa LEFT JOIN devices d ON d.id=sa.device_id
                      WHERE sa.scene_id=? ORDER BY sa.order_no, sa.id`, s.id)
   // 统一校验：触发场景前，所有「可解析的绑定设备」都必须在操作范围内（原子拒绝，绝不执行一半；
-  // 已删除/重名待绑定的失效动作不算越权，仍按既有逻辑逐项跳过失败）
-  if (!isUnscoped(req.member)) {
-    const out = actions.filter((a) => a.did && !canAccessDevice(req.member, { id: a.did, room_id: a.droom }))
-    if (out.length)
-      return scopeDenied(res, `场景包含范围外设备：${out.map((a) => a.dname).join('、')}`)
-  }
+  // 已删除/重名待绑定的失效动作不算越权，仍按既有逻辑逐项跳过失败）——
+  // 与新建编排、启停、删除共用 family.js 的同一判定函数
+  const outOfScope = sceneOutOfScopeDevices(req.member, s.id)
+  if (outOfScope.length)
+    return scopeDenied(res, `场景包含范围外设备：${outOfScope.join('、')}`)
   const executed = [], failed = []
   const changed = new Set()
   const batchAt = new Date()
@@ -430,13 +401,9 @@ const BATCH_ACTION_LABEL = {
 }
 app.post('/api/quota/batch', requirePerm('quota_manage'), (req, res) => {
   try {
-    // 逐项范围授权：新建按目标房间/设备判定，既有定额按其行判定；越权项只标记失败
-    const authorize = (row) => {
-      if (isUnscoped(req.member)) return true
-      if (row.scope === 'room') return canAccessRoom(req.member, row.room_id)
-      const d = q1('SELECT id,room_id FROM devices WHERE id=?', row.device_id)
-      return d ? canAccessDevice(req.member, d) : memberScope(req.member).devices.includes(Number(row.device_id))
-    }
+    // 逐项范围授权：与单条定额同一套 canAccessQuota 判定（新建按目标对象描述、其余按定额行），
+    // 越权项只标记失败（no_scope），不拖垮整批
+    const authorize = (row) => canAccessQuota(req.member, row)
     const { results, applied, failed } = applyBatchQuota(req.body || {}, authorize)
     const skipped = results.filter((r) => r.skipped).length
     const fails = results.filter((r) => !r.ok).map((r) => `${r.label}（${r.message}）`).join('；')
@@ -470,24 +437,18 @@ app.post('/api/quota-alert/:id/handle', requirePerm('quota_alert_handle'), (req,
     res.json({ ok: true })
   } catch (e) { res.status(400).json({ error: e.message }) }
 })
-// 告警批量处理：同一状态流转 + 同一备注应用到多条告警；
-// 每条成功项单独写家庭日志时间线（带操作人），形成逐项审计
+// 告警批量处理：同一状态流转 + 同一备注应用到多条告警。
+// 与批量定额配置、批量工单同一口径：逐项范围授权（越权项标记 no_scope 失败，不拖垮整批），
+// 每条成功项单独写家庭日志时间线，末尾再写一条汇总审计（含失败/越权明细，冲突可追溯）
 app.post('/api/quota-alert/batch-handle', requirePerm('quota_alert_handle'), (req, res) => {
   try {
     const { ids, status, note } = req.body || {}
-    // 批量统一校验：任一告警归属对象超出范围则整批拒绝（原子处理，避免部分流转造成审计割裂）
-    if (!isUnscoped(req.member)) {
-      const idList = Array.isArray(ids) ? ids : []
-      const denied = []
-      for (const rawId of idList) {
-        const a = q1('SELECT qa.*, q.scope q_scope, q.room_id, q.device_id FROM quota_alerts qa LEFT JOIN energy_quotas q ON q.id=qa.quota_id WHERE qa.id=?', Number(rawId))
-        if (!a) continue
-        const okRow = a.q_scope ? canAccessQuota(req.member, { scope: a.q_scope, room_id: a.room_id, device_id: a.device_id }) : false
-        if (!okRow) denied.push(a.target_name)
-      }
-      if (denied.length) return scopeDenied(res, `告警超出操作范围：${denied.join('、')}`)
+    // 与单条处理同一判定：告警归属定额仍在 → 按定额对象判定；定额已删除 → 仅全屋身份可处理
+    const authorize = (a) => {
+      const qq = a.quota_id != null ? q1('SELECT * FROM energy_quotas WHERE id=?', a.quota_id) : null
+      return qq ? canAccessQuota(req.member, qq) : isUnscoped(req.member)
     }
-    const { results, applied, failed } = batchHandleAlerts(ids, { status, note })
+    const { results, applied, failed } = batchHandleAlerts(ids, { status, note }, authorize)
     const label = { handling: '开始处理', resolved: '标记已处理', ignored: '忽略告警', open: '重新打开/退回' }[status] || '更新状态'
     const periodLabel = { daily: '每日', weekly: '每周', monthly: '每月' }
     for (const r of results) {
@@ -497,6 +458,11 @@ app.post('/api/quota-alert/batch-handle', requirePerm('quota_alert_handle'), (re
         `${periodLabel[a.period] || a.period}用量 ${a.used_kwh.toFixed(2)}/${a.limit_kwh}kWh` + (note ? `；备注：${note}` : ''),
         { category: 'quota' })
     }
+    // 汇总审计：与批量定额配置的汇总日志同口径，失败/越权项同样留痕
+    const fails = results.filter((r) => !r.ok).map((r) => `${r.label}（${r.message}）`).join('；')
+    log('定额', `定额告警批量${label}`,
+      `共 ${results.length} 条：成功 ${applied} 条` + (failed ? `，失败 ${failed} 条：${fails}` : '，全部成功'),
+      { category: 'quota' })
     res.json({ ok: failed === 0, applied, failed, results })
   } catch (e) { res.status(400).json({ error: e.message }) }
 })
