@@ -613,19 +613,20 @@ export function handleAlert(id, { status, note }) {
   const a = stmts.alertById.get(id)
   if (!a) throw new Error('告警不存在')
   if (!['open', 'handling', 'resolved', 'ignored'].includes(status)) throw new Error('处理状态无效')
+  // 状态机拒绝标记 conflict：多为并发冲突（前端快照过期，他人已抢先处理/系统已校准），路由层统一写审计日志
   if (!NEXT_STATUS[a.status].includes(status))
-    throw new Error(`不能从「${STATUS_LABEL[a.status]}」流转到「${STATUS_LABEL[status]}」，请先退回待处理`)
+    throw Object.assign(new Error(`不能从「${STATUS_LABEL[a.status]}」流转到「${STATUS_LABEL[status]}」，请先退回待处理`), { conflict: true })
 
   if (status === 'open') {
     // 重新打开前校验：额度仍在、告警身份仍是当前周期、用量仍越线
     const q = stmts.quotaById.get(a.quota_id)
-    if (!q || !q.enabled) throw new Error('定额已停用或删除，无法重新打开')
+    if (!q || !q.enabled) throw Object.assign(new Error('定额已停用或删除，无法重新打开'), { conflict: true })
     const { start, end } = periodRange(q.period)
     if (q.period !== a.period || start.toISOString() !== a.period_start)
-      throw new Error('该告警属于已结束的旧周期，不能重新打开')
+      throw Object.assign(new Error('该告警属于已结束的旧周期，不能重新打开'), { conflict: true })
     const used = computeUsage(q)
     const level = used / q.limit_kwh >= 1 ? 'error' : used / q.limit_kwh >= WARN_RATIO ? 'warn' : null
-    if (!level) throw new Error('当前用量已低于预警线，无需重新打开')
+    if (!level) throw Object.assign(new Error('当前用量已低于预警线，无需重新打开'), { conflict: true })
     const at = new Date()
     const nextNote = note != null && String(note) ? appendNote(a.note, `重新打开：${String(note)}`) : a.note
     stmts.raiseAlert.run(level, used, q.limit_kwh, end.toISOString(), at.toISOString(), a.id)
@@ -651,22 +652,31 @@ export function batchHandleAlerts(ids, { status, note }) {
   if (ids.length > BATCH_LIMIT) throw new Error(`单次批量最多 ${BATCH_LIMIT} 条告警`)
   if (!['open', 'handling', 'resolved', 'ignored'].includes(status)) throw new Error('处理状态无效')
   const results = []
-  for (const rawId of ids) {
-    const id = Number(rawId)
-    const before = stmts.alertById.get(id)
-    const label = before
-      ? `${before.scope === 'room' ? '房间' : '设备'}·${before.target_name}`
-      : `告警#${rawId}`
-    if (!before) {
-      results.push({ ok: false, id, label, message: '告警不存在' })
-      continue
+  // 整批单事务落库（与批量定额/批量工单同一口径）：逐项状态机校验单项失败只标记该项，
+  // 灾难性错误整批回滚，不留半批中间态；成功项由调用方逐项写家庭日志时间线
+  db.exec('BEGIN')
+  try {
+    for (const rawId of ids) {
+      const id = Number(rawId)
+      const before = stmts.alertById.get(id)
+      const label = before
+        ? `${before.scope === 'room' ? '房间' : '设备'}·${before.target_name}`
+        : `告警#${rawId}`
+      if (!before) {
+        results.push({ ok: false, id, label, message: '告警不存在' })
+        continue
+      }
+      try {
+        const after = handleAlert(id, { status, note })
+        results.push({ ok: true, id, label, message: `已流转为「${STATUS_LABEL[after.status]}」`, alert: after })
+      } catch (e) {
+        results.push({ ok: false, id, label, message: e.message, conflict: !!e.conflict })
+      }
     }
-    try {
-      const after = handleAlert(id, { status, note })
-      results.push({ ok: true, id, label, message: `已流转为「${STATUS_LABEL[after.status]}」`, alert: after })
-    } catch (e) {
-      results.push({ ok: false, id, label, message: e.message })
-    }
+    db.exec('COMMIT')
+  } catch (e) {
+    db.exec('ROLLBACK')
+    throw e
   }
   return { results, applied: results.filter((r) => r.ok).length, failed: results.filter((r) => !r.ok).length }
 }

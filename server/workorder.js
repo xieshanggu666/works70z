@@ -332,8 +332,9 @@ function buildEventLog(wo, action, detail) {
 function operateWorkOrderRaw(wo, action, actor, { assignee_id, note } = {}, at = new Date()) {
   const rule = TRANSITIONS[action]
   if (!rule) throw new Error('工单操作类型无效')
+  // 状态机拒绝标记 conflict：多为并发冲突（前端快照过期，他人已抢先流转），路由层统一写审计日志
   if (!rule.from.includes(wo.status))
-    throw new Error(`工单当前为「${STATUS_LABEL[wo.status]}」，不能执行「${TRANSITION_LABEL[action] || action}」`)
+    throw Object.assign(new Error(`工单当前为「${STATUS_LABEL[wo.status]}」，不能执行「${TRANSITION_LABEL[action] || action}」`), { conflict: true })
   if (!actor || actor.status !== 'active') throw new Error('身份无效，无法操作工单')
 
   const atIso = at.toISOString()
@@ -379,7 +380,7 @@ function operateWorkOrderRaw(wo, action, actor, { assignee_id, note } = {}, at =
     }
     if (action === 'reopen') {
       if (!wo.source_active)
-        throw new Error('触发工单的源告警已消除，无需复开；若告警再次出现系统会自动另开新工单')
+        throw Object.assign(new Error('触发工单的源告警已消除，无需复开；若告警再次出现系统会自动另开新工单'), { conflict: true })
       const reopenNote = String(note || '').trim()
       if (!reopenNote) throw new Error('复开工单必须填写复开原因')
       nextNote = appendNote(nextNote, `复开：${reopenNote}`)

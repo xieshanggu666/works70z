@@ -2,7 +2,7 @@
   <div class="scenes">
     <div v-if="!store.current" class="lock-banner">🔒 浏览模式：访客/成员加入家庭后可触发场景，场景编排需「场景管理」权限。</div>
     <div v-else-if="!canRun" class="lock-banner">🔒 当前角色没有场景执行权限，仅可查看场景。</div>
-    <div v-else-if="!store.isUnscoped()" class="lock-banner scope-banner">🧭 操作范围：{{ store.scopeLabel(store.currentMember) }}；含范围外设备的场景不可触发，编排时只能选择授权设备。</div>
+    <div v-else-if="!store.isUnscoped()" class="lock-banner scope-banner">🧭 操作范围：{{ store.scopeLabel(store.currentMember) }}；含范围外设备的场景不可触发/启停/删除，编排时只能选择授权设备。</div>
     <div class="toolbar">
       <button class="add" :disabled="!canManage" :title="canManage?'':'无场景管理权限'" @click="canManage && (showBuilder = !showBuilder)">＋ 新建场景</button>
     </div>
@@ -57,8 +57,13 @@
           <button class="run" :disabled="!s.enabled || !canRun || !sceneInScope(s)"
                   :title="!canRun ? '无场景执行权限' : (!sceneInScope(s) ? '场景包含操作范围外的设备（后端将拒绝执行）' : '')"
                   @click="canRun && sceneInScope(s) && run(s)">▶ 触发</button>
-          <button v-if="canManage" class="ghost" @click="store.toggleScene(s.id)">{{ s.enabled?'停用':'启用' }}</button>
-          <button v-if="canManage" class="ghost del" @click="remove(s)">删除</button>
+          <!-- 启停/删除与触发同一范围口径：含范围外设备的场景置灰（后端 sceneOutOfScope 同口径拦截） -->
+          <button v-if="canManage" class="ghost" :disabled="!sceneInScope(s)"
+                  :title="sceneInScope(s) ? '' : '场景包含操作范围外的设备（后端将拒绝启停）'"
+                  @click="sceneInScope(s) && store.toggleScene(s.id)">{{ s.enabled?'停用':'启用' }}</button>
+          <button v-if="canManage" class="ghost del" :disabled="!sceneInScope(s)"
+                  :title="sceneInScope(s) ? '' : '场景包含操作范围外的设备（后端将拒绝删除）'"
+                  @click="sceneInScope(s) && remove(s)">删除</button>
         </div>
       </div>
       <div v-if="!store.scenes.length" class="none">暂无场景</div>
@@ -122,6 +127,7 @@ input,select,button{font-family:inherit;background:#13233f;border:1px solid rgba
 .step{display:flex;gap:8px;}
 .rm{background:none;border:none;color:#ef5350;cursor:pointer;}
 .ghost{background:#16263f;color:#8ba2c8;cursor:pointer;}
+.ghost:disabled{opacity:.45;cursor:not-allowed;}
 .btns{display:flex;gap:8px;margin-top:6px;}
 .save{background:#2962ff;border:none;color:#fff;font-weight:600;cursor:pointer;}
 .list{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:12px;}
